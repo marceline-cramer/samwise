@@ -1,29 +1,32 @@
-use std::process::{Command, Stdio};
+use std::{
+    process::{Command, Stdio},
+    sync::mpsc::{Receiver, channel},
+};
 
 use anyhow::Context;
 use discord_presence::models::Activity;
 use rig::{client::CompletionClient, completion::Prompt, providers::openai};
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub openai: OpenAIConfig,
     pub agent: AgentConfig,
     pub discord: DiscordConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct DiscordConfig {
     pub client: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct OpenAIConfig {
     pub key: String,
     pub model: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AgentConfig {
     pub preamble: String,
     pub prompt: String,
@@ -39,6 +42,12 @@ async fn main() -> anyhow::Result<()> {
 
     let config: Config = toml::from_str(&config_src).context("failed to parse config file")?;
 
+    let (presence_tx, presence_rx) = channel();
+    let rpc_thread = std::thread::spawn({
+        let config = config.clone();
+        move || rpc_thread(config, presence_rx)
+    });
+
     let client = openai::Client::<reqwest::Client>::new(&config.openai.key)
         .context("failed to create OpenAI client")?;
 
@@ -50,31 +59,47 @@ async fn main() -> anyhow::Result<()> {
         .context(&diff)
         .build();
 
-    let response = agent
+    let mut response = agent
         .prompt(&config.agent.prompt)
         .await
         .context("failed to run prompt")?;
 
-    println!("{response}");
+    // responses need to be at most 120 characters or setting activity fails
+    response.truncate(128);
 
+    let activity = Activity::new().details("coding").state(&response);
+
+    presence_tx.send(activity).unwrap();
+
+    drop(presence_tx);
+
+    rpc_thread.join().unwrap()?;
+
+    Ok(())
+}
+
+/// The Discord RPC needs to run its own thread because it uses crossbeam on
+/// the inside. I'd love to write my own async bindings at some point but...
+/// one thing at a time.
+pub fn rpc_thread(config: Config, presence_rx: Receiver<Activity>) -> anyhow::Result<()> {
     let mut drpc = discord_presence::Client::new(config.discord.client);
+
+    drpc.on_error(|ctx| {
+        println!("RPC error: {:?}", ctx.event);
+    })
+    .persist();
 
     drpc.start();
 
     drpc.block_until_event(discord_presence::Event::Ready)
-        .context("failed to wait for Discord RPC ready")?;
+        .context("failed to wait for ready state")?;
 
-    println!("RPC is ready");
+    while let Ok(activity) = presence_rx.recv() {
+        drpc.set_activity(|_| activity)
+            .context("failed to set Discord activity")?;
+    }
 
-    drpc.set_activity(|_| Activity::new().state("coding").details(&response))
-        .context("failed to set Discord activity")?;
-
-    println!("status is set");
-
-    drpc.block_on()
-        .context("failed to join Discord RPC client")?;
-
-    Ok(())
+    drpc.block_on().context("failed to join Discord RPC client")
 }
 
 pub fn get_diff() -> anyhow::Result<String> {
