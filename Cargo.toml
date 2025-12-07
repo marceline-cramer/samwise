@@ -1,0 +1,22 @@
+[package]
+name = "samwise"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+dirs = "6"
+discord-presence = "3"
+reqwest = "0.12"
+toml = "0.9.8"
+
+[dependencies.rig-core]
+version = "0.26"
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+
+[dependencies.tokio]
+version = "1.48"
+features = ["macros", "rt-multi-thread"]
