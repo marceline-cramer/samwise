@@ -5,12 +5,16 @@ use std::{
 
 use anyhow::Context;
 use discord_presence::models::Activity;
-use rig::{client::CompletionClient, completion::Prompt, providers::openai};
+use rig::{
+    client::{CompletionClient, Nothing},
+    completion::Prompt,
+    providers::ollama,
+};
 use serde::Deserialize;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone, Deserialize)]
 pub struct Config {
-    pub openai: OpenAIConfig,
     pub agent: AgentConfig,
     pub discord: DiscordConfig,
 }
@@ -21,19 +25,19 @@ pub struct DiscordConfig {
 }
 
 #[derive(Clone, Deserialize)]
-pub struct OpenAIConfig {
-    pub key: String,
-    pub model: String,
-}
-
-#[derive(Clone, Deserialize)]
 pub struct AgentConfig {
+    pub model: String,
     pub preamble: String,
     pub prompt: String,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     let config_path = dirs::config_dir()
         .context("could not locate config path")?
         .join("samwise.toml");
@@ -48,13 +52,13 @@ async fn main() -> anyhow::Result<()> {
         move || rpc_thread(config, presence_rx)
     });
 
-    let client = openai::Client::<reqwest::Client>::new(&config.openai.key)
-        .context("failed to create OpenAI client")?;
+    let client: ollama::Client<reqwest::Client> =
+        ollama::Client::new(Nothing).context("failed to create Ollama client")?;
 
     let diff = get_diff().context("failed to get diff")?;
 
     let agent = client
-        .agent(&config.openai.model)
+        .agent(&config.agent.model)
         .preamble(&config.agent.preamble)
         .context(&diff)
         .build();
@@ -65,9 +69,9 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to run prompt")?;
 
     // responses need to be at most 120 characters or setting activity fails
-    response.truncate(128);
+    response.truncate(120);
 
-    let activity = Activity::new().details("coding").state(&response);
+    let activity = Activity::new().details(&response);
 
     presence_tx.send(activity).unwrap();
 
@@ -89,10 +93,24 @@ pub fn rpc_thread(config: Config, presence_rx: Receiver<Activity>) -> anyhow::Re
     })
     .persist();
 
+    drpc.on_connected(|ctx| {
+        println!("RPC connected: {:?}", ctx.event);
+    })
+    .persist();
+
+    drpc.on_disconnected(|ctx| {
+        println!("RPC disconnected: {:?}", ctx.event);
+    })
+    .persist();
+
     drpc.start();
+
+    println!("waiting for Discord RPC...");
 
     drpc.block_until_event(discord_presence::Event::Ready)
         .context("failed to wait for ready state")?;
+
+    println!("Discord RPC is ready.");
 
     while let Ok(activity) = presence_rx.recv() {
         drpc.set_activity(|_| activity)
