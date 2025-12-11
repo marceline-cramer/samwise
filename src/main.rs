@@ -1,6 +1,7 @@
 use std::{
     process::{Command, Stdio},
     sync::mpsc::{Receiver, channel},
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -15,6 +16,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone, Deserialize)]
 pub struct Config {
+    #[serde(with = "humantime_serde")]
+    pub frequency: Duration,
     pub agent: AgentConfig,
     pub discord: DiscordConfig,
 }
@@ -47,7 +50,8 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = toml::from_str(&config_src).context("failed to parse config file")?;
 
     let (presence_tx, presence_rx) = channel();
-    let rpc_thread = std::thread::spawn({
+
+    std::thread::spawn({
         let config = config.clone();
         move || rpc_thread(config, presence_rx)
     });
@@ -55,37 +59,50 @@ async fn main() -> anyhow::Result<()> {
     let client: ollama::Client<reqwest::Client> =
         ollama::Client::new(Nothing).context("failed to create Ollama client")?;
 
-    let diff = get_diff().context("failed to get diff")?;
+    let mut last_diff = None;
 
-    let agent = client
-        .agent(&config.agent.model)
-        .preamble(&config.agent.preamble)
-        .context(&diff)
-        .build();
+    loop {
+        let diff = get_diff().context("failed to get diff")?;
 
-    let mut response = agent
-        .prompt(&config.agent.prompt)
-        .await
-        .context("failed to run prompt")?;
+        if diff.is_empty() {
+            presence_tx.send(None).unwrap();
+            std::thread::sleep(config.frequency);
+            continue;
+        }
 
-    // responses need to be at most 120 characters or setting activity fails
-    response.truncate(120);
+        if Some(&diff) == last_diff.as_ref() {
+            std::thread::sleep(config.frequency);
+            continue;
+        }
 
-    let activity = Activity::new().details(&response);
+        let agent = client
+            .agent(&config.agent.model)
+            .preamble(&config.agent.preamble)
+            .context(&diff)
+            .build();
 
-    presence_tx.send(activity).unwrap();
+        let mut response = agent
+            .prompt(&config.agent.prompt)
+            .await
+            .context("failed to run prompt")?;
 
-    drop(presence_tx);
+        // responses need to be at most 120 characters or setting activity fails
+        response.truncate(120);
 
-    rpc_thread.join().unwrap()?;
+        let activity = Activity::new().details(&response);
 
-    Ok(())
+        presence_tx.send(Some(activity)).unwrap();
+
+        std::thread::sleep(config.frequency);
+
+        last_diff = Some(diff);
+    }
 }
 
 /// The Discord RPC needs to run its own thread because it uses crossbeam on
 /// the inside. I'd love to write my own async bindings at some point but...
 /// one thing at a time.
-pub fn rpc_thread(config: Config, presence_rx: Receiver<Activity>) -> anyhow::Result<()> {
+pub fn rpc_thread(config: Config, presence_rx: Receiver<Option<Activity>>) -> anyhow::Result<()> {
     let mut drpc = discord_presence::Client::new(config.discord.client);
 
     drpc.on_error(|ctx| {
@@ -113,8 +130,16 @@ pub fn rpc_thread(config: Config, presence_rx: Receiver<Activity>) -> anyhow::Re
     println!("Discord RPC is ready.");
 
     while let Ok(activity) = presence_rx.recv() {
-        drpc.set_activity(|_| activity)
-            .context("failed to set Discord activity")?;
+        match activity {
+            Some(activity) => {
+                drpc.set_activity(|_| activity)
+                    .context("failed to set Discord activity")?;
+            }
+            None => {
+                drpc.clear_activity()
+                    .context("failed to clear Discord activity")?;
+            }
+        }
     }
 
     drpc.block_on().context("failed to join Discord RPC client")
